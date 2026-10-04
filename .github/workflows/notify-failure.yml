@@ -1,6 +1,6 @@
 # Reusable: failure-only notifications. Called from each repo's notify-failure.yml
 # stub, which owns the `workflow_run` trigger (a trigger cannot live here) and
-# passes its secrets with `secrets: inherit`.
+# passes the two secrets by name (`secrets: inherit` stops at the owner boundary).
 #
 # Why a separate workflow and not a last step: `workflow_run` delivers the watched
 # run's *final* conclusion, so this sees `cancelled` and `timed_out` — neither of
