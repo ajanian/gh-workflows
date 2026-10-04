@@ -11,7 +11,7 @@ third-party action, lives here.
 
 | Workflow | What it does | Caller stub |
 |---|---|---|
-| `pr.yml` | Runs the caller's `gate` on every PR. For a Dependabot PR that passed it: squash-merge patch/minor, one comment on a major. | `ci.yml`: `pull_request` trigger, per-PR concurrency, the gate as `with:` |
+| `pr.yml` | Runs the caller's `gate` on every PR. For a Dependabot PR that passed it: squash-merge bumps that are positively patch or minor; one comment on anything else. | `ci.yml`: `pull_request` trigger, per-PR concurrency, the gate as `with:` |
 | `deploy-cloud-run.yml` | Drift check → optional verify → build (Cloud Build or buildx) → no-traffic candidate → smoke check → optional candidate hook → promote → roll back to the traffic-holding revision → `production` tag | `deploy.yml`: push / 6-hourly cron / dispatch, concurrency, the project values as `with:` |
 | `notify-failure.yml` | Slack webhook on any non-success run; healthchecks ping on every Deploy completion | `notify.yml`: the `workflow_run` trigger, a `workflow_dispatch` wiring test, `secrets: inherit` |
 

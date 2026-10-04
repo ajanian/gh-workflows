@@ -8,8 +8,8 @@
 #   gate       — checkout the PR merged into its base (the default pull_request
 #                ref), setup-node, run the caller's commands. Read-only token.
 #   automerge  — Dependabot PRs only, and only after `gate` passed: squash-merge
-#                patch and minor bumps; a major gets one comment and stays open
-#                for a human.
+#                bumps that are positively patch or minor; anything else gets one
+#                comment and stays open for a human.
 #
 # Why self-gated: branch-protection auto-merge needs a paid plan on private
 # repos, so the merge happens here, behind `needs: gate`.
@@ -65,6 +65,23 @@ jobs:
       - id: meta
         uses: dependabot/fetch-metadata@v3
 
+      # Merge only what is positively patch or minor. Version updates state their
+      # update-type; security updates do not, and fetch-metadata derives it from
+      # the versions when it can and leaves it empty when it cannot (typically a
+      # multi-package PR). An unknown is treated like a major, not waved through.
+      - id: kind
+        env:
+          DEPS: ${{ steps.meta.outputs.updated-dependencies-json }}
+        run: |
+          held=$(jq -r '[.[] | select(.updateType != "version-update:semver-patch" and .updateType != "version-update:semver-minor") | .dependencyName] | join(", ")' <<<"$DEPS")
+          count=$(jq -r 'length' <<<"$DEPS")
+          if [ "$count" -gt 0 ] && [ -z "$held" ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "safe=false" >> "$GITHUB_OUTPUT"
+            echo "Not auto-merging: ${held:-no dependency metadata}"
+          fi
+
       # One run per PR, in parallel — a concurrency group shared across PRs keeps
       # a single pending run and cancels the rest, which silently drops the middle
       # PRs of a batch. Parallel merges race instead ("base branch was modified"),
@@ -72,7 +89,7 @@ jobs:
       # run owns it) and a conflict (Dependabot rebases, which re-triggers this).
       # --match-head-commit keeps the merge to the commit the gate ran on.
       - name: Merge (patch/minor)
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        if: steps.kind.outputs.safe == 'true'
         run: |
           for attempt in 1 2 3 4; do
             gh pr merge --squash --delete-branch --match-head-commit "$HEAD_SHA" "$PR_URL" && exit 0
@@ -92,10 +109,10 @@ jobs:
 
       # Once per PR: every rebase re-runs this job, and a comment per run buries
       # the PR.
-      - name: Flag major for manual review
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+      - name: Flag for manual review
+        if: steps.kind.outputs.safe != 'true'
         env:
-          NOTE: Major version bump — the gate passed, but it is not auto-merged. Review and merge manually.
+          NOTE: "Not auto-merged: this is a major bump, or one whose size Dependabot did not state. The gate passed; review and merge manually."
         run: |
           if gh pr view "$PR_URL" --json comments --jq '.comments[].body' | grep -qF "$NOTE"; then
             echo "Already flagged."
