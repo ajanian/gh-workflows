@@ -1,0 +1,274 @@
+# Reusable: build + deploy a Cloud Run service with a no-traffic candidate.
+#
+# Called from each repo's deploy.yml stub. The stub owns the triggers (push to
+# main, 6-hourly drift cron, dispatch), the concurrency group and permissions;
+# this file owns the behaviour, so a fix here reaches every caller on its next run.
+#
+# Flow:
+#   drift   — on the cron only: skip when prod's /api/version already equals main.
+#             This is what folds in Dependabot auto-merges, whose GITHUB_TOKEN
+#             merges cannot fire push workflows (anti-recursion rule).
+#   verify  — optional: the caller's test/typecheck gate, run before anything builds.
+#   deploy  — auth (keyless WIF) → pre_deploy hook → build → deploy a candidate
+#             revision with --no-traffic → smoke-check it on its own tagged URL →
+#             optional candidate_check hook → promote → verify prod → on failure
+#             roll traffic back to the revision that held it → move the
+#             `production` git tag.
+#
+# A broken build therefore never serves a request, and the 6-hourly retry of a
+# broken main is harmless. The rollback target is the revision holding traffic,
+# never latestReadyRevisionName (which after a failed candidate is the broken one).
+#
+# Caller contract: GET {app_url}/api/version → {"data":{"commit":"<short-sha>"}}
+# read from the COMMIT_SHA env var this workflow stamps.
+name: Deploy to Cloud Run (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: GCP project id
+        required: true
+        type: string
+      region:
+        required: true
+        type: string
+      service:
+        description: Cloud Run service name
+        required: true
+        type: string
+      image:
+        description: Artifact Registry image path without a tag (…-docker.pkg.dev/<project>/<repo>/app)
+        required: true
+        type: string
+      app_url:
+        description: Public https URL the smoke checks hit
+        required: true
+        type: string
+      workload_identity_provider:
+        description: projects/<num>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+        required: true
+        type: string
+      service_account:
+        description: The deployer SA impersonated via WIF
+        required: true
+        type: string
+      build:
+        description: "cloud-build (gcloud builds submit; SA needs cloudbuild.builds.editor) or docker (buildx on the runner, pushed with artifactregistry.writer)"
+        type: string
+        default: cloud-build
+      env_vars:
+        description: "Extra env for the service, ##-separated KEY=VALUE pairs (values may contain commas). Merged, never replaced."
+        type: string
+        default: ""
+      deploy_flags:
+        description: Extra `gcloud run deploy` flags (--set-secrets, --service-account, --allow-unauthenticated, sizing…)
+        type: string
+        default: ""
+      node_version:
+        type: string
+        default: "26"
+      verify:
+        description: Shell run in its own job (after checkout + setup-node) before deploy. Empty = no verify job.
+        type: string
+        default: ""
+      pre_deploy:
+        description: Shell run after auth, before build (schema sync etc). PROJECT/REGION/SERVICE/IMAGE/APP_URL are in env.
+        type: string
+        default: ""
+      candidate_check:
+        description: Shell run against the candidate after the smoke check; CAND_URL is in env. Non-zero = candidate never promoted.
+        type: string
+        default: ""
+
+env:
+  PROJECT: ${{ inputs.project }}
+  REGION: ${{ inputs.region }}
+  SERVICE: ${{ inputs.service }}
+  IMAGE: ${{ inputs.image }}
+  APP_URL: ${{ inputs.app_url }}
+
+jobs:
+  drift:
+    name: Drift check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      skip: ${{ steps.check.outputs.skip }}
+    steps:
+      - name: Compare prod commit to main (scheduled runs only)
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            RUNNING=$(curl -s --max-time 20 "$APP_URL/api/version" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['commit'])" 2>/dev/null || echo unknown)
+            if [ "$RUNNING" = "${GITHUB_SHA::7}" ]; then
+              echo "Prod already at ${GITHUB_SHA::7} — nothing to do."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Prod at $RUNNING, main at ${GITHUB_SHA::7} — deploying."
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  verify:
+    name: Verify
+    needs: drift
+    if: needs.drift.outputs.skip != 'true' && inputs.verify != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+      - name: Caller's verify gate
+        run: ${{ inputs.verify }}
+
+  deploy:
+    name: Build and deploy
+    needs: [drift, verify]
+    # verify is skipped (not failed) when the caller has no gate — allow that, block on failure.
+    if: >-
+      !cancelled()
+      && needs.drift.outputs.skip != 'true'
+      && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ inputs.workload_identity_provider }}
+          service_account: ${{ inputs.service_account }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Pre-deploy hook
+        if: inputs.pre_deploy != ''
+        run: ${{ inputs.pre_deploy }}
+
+      - name: Record the revision holding traffic (rollback target)
+        id: prev
+        run: |
+          # NOT latestReadyRevisionName: after a candidate that boots but fails its
+          # checks, that is the broken revision. Empty on a brand-new service.
+          PREV=$(gcloud run services describe "$SERVICE" --region "$REGION" --format json \
+            | python3 -c "import json,sys; t=json.load(sys.stdin).get('status',{}).get('traffic') or []; print(max(t, key=lambda x: x.get('percent',0))['revisionName'] if t else '')")
+          echo "revision=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Currently serving: ${PREV:-<nothing>}"
+
+      - name: Build image (Cloud Build)
+        if: inputs.build == 'cloud-build'
+        run: |
+          gcloud builds submit --region "$REGION" --tag "$IMAGE:${GITHUB_SHA::7}"
+
+      - name: Configure Docker for Artifact Registry
+        if: inputs.build == 'docker'
+        run: gcloud auth configure-docker "${IMAGE%%/*}" --quiet
+
+      - uses: docker/setup-buildx-action@v4
+        if: inputs.build == 'docker'
+
+      - name: Build image (buildx, pushed from the runner)
+        if: inputs.build == 'docker'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ inputs.image }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Tag pushed image with the short sha
+        if: inputs.build == 'docker'
+        run: |
+          # Cloud Build path tags :<short-sha> directly; make the docker path match so
+          # the deploy step below is one line for both.
+          gcloud artifacts docker tags add "$IMAGE:$GITHUB_SHA" "$IMAGE:${GITHUB_SHA::7}" --quiet
+
+      - name: Deploy candidate revision (no traffic)
+        id: candidate
+        env:
+          EXTRA_ENV: ${{ inputs.env_vars }}
+          EXTRA_FLAGS: ${{ inputs.deploy_flags }}
+        run: |
+          # --update-env-vars merges (never --set-env-vars: it would wipe the service's
+          # other env). ## delimiter so values may contain commas. Stamps /api/version.
+          VARS="COMMIT_SHA=${GITHUB_SHA::7}##DEPLOYED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          [ -z "$EXTRA_ENV" ] || VARS="$VARS##$EXTRA_ENV"
+          # shellcheck disable=SC2086  # EXTRA_FLAGS is a flag list by contract
+          gcloud run deploy "$SERVICE" --region "$REGION" \
+            --image "$IMAGE:${GITHUB_SHA::7}" \
+            --no-traffic \
+            --update-env-vars "^##^$VARS" \
+            $EXTRA_FLAGS
+          REV=$(gcloud run services describe "$SERVICE" --region "$REGION" \
+            --format "value(status.latestCreatedRevisionName)")
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" \
+            --update-tags "candidate=$REV" > /dev/null
+          URL=$(gcloud run services describe "$SERVICE" --region "$REGION" --format json \
+            | python3 -c "import json,sys; print(next(t['url'] for t in json.load(sys.stdin)['status']['traffic'] if t.get('tag')=='candidate'))")
+          echo "revision=$REV" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Candidate $REV at $URL"
+
+      - name: Smoke check candidate
+        env:
+          CAND_URL: ${{ steps.candidate.outputs.url }}
+        run: |
+          # "/" answering 2xx or 3xx means the app is up (a redirect to sign-in
+          # counts); the sha match on /api/version is the actual assertion.
+          for _ in $(seq 1 10); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$CAND_URL/")
+            VER=$(curl -s "$CAND_URL/api/version" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['commit'])" 2>/dev/null || echo unknown)
+            if [[ "$CODE" =~ ^[23][0-9][0-9]$ ]] && [ "$VER" = "${GITHUB_SHA::7}" ]; then
+              echo "OK — candidate serves ${GITHUB_SHA::7} (/ → HTTP $CODE)"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Smoke check failed (last: HTTP $CODE, version $VER) — candidate never promoted, traffic untouched"
+          exit 1
+
+      - name: Candidate check hook
+        if: inputs.candidate_check != ''
+        env:
+          CAND_URL: ${{ steps.candidate.outputs.url }}
+        run: ${{ inputs.candidate_check }}
+
+      - name: Drop candidate tag
+        if: always() && steps.candidate.outcome == 'success'
+        run: |
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" \
+            --remove-tags candidate > /dev/null || true
+
+      - name: Promote candidate (rolls back on failure)
+        env:
+          REV: ${{ steps.candidate.outputs.revision }}
+          PREV: ${{ steps.prev.outputs.revision }}
+        run: |
+          gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions "$REV=100"
+          for _ in $(seq 1 10); do
+            VER=$(curl -s "$APP_URL/api/version" | python3 -c "import json,sys; print(json.load(sys.stdin)['data']['commit'])" 2>/dev/null || echo unknown)
+            if [ "$VER" = "${GITHUB_SHA::7}" ]; then
+              echo "OK — $APP_URL serving ${GITHUB_SHA::7}"
+              exit 0
+            fi
+            sleep 5
+          done
+          if [ -n "$PREV" ]; then
+            echo "Promoted revision not answering at $APP_URL — rolling back to $PREV"
+            gcloud run services update-traffic "$SERVICE" --region "$REGION" --to-revisions "$PREV=100"
+          else
+            echo "Promoted revision not answering at $APP_URL and nothing to roll back to"
+          fi
+          exit 1
+
+      - name: Point `production` tag at deployed commit
+        run: |
+          git tag -f production "$GITHUB_SHA"
+          git push -f origin production

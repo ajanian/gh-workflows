@@ -1,0 +1,104 @@
+# Reusable: the PR gate, with Dependabot auto-merge behind it.
+#
+# Called from each repo's ci.yml stub, which owns the `pull_request` trigger, the
+# per-PR concurrency group and the permissions. The caller passes its build/test
+# commands as `gate` — written once, so the check a human PR gets and the check
+# that lets a Dependabot bump merge cannot drift apart.
+#
+#   gate       — checkout the PR merged into its base (the default pull_request
+#                ref), setup-node, run the caller's commands. Read-only token.
+#   automerge  — Dependabot PRs only, and only after `gate` passed: squash-merge
+#                patch and minor bumps; a major gets one comment and stays open
+#                for a human.
+#
+# Why self-gated: branch-protection auto-merge needs a paid plan on private
+# repos, so the merge happens here, behind `needs: gate`.
+#
+# Deploy implication: merges made with GITHUB_TOKEN do NOT trigger push workflows
+# (anti-recursion rule). The Deploy stub's 6-hourly drift check picks them up, so
+# a merged bump reaches production within ~6 hours.
+name: PR gate (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      gate:
+        description: Shell run on the PR after checkout + setup-node (npm ci, build, tests…). Non-zero fails the PR and blocks auto-merge.
+        required: true
+        type: string
+      node_version:
+        type: string
+        default: "26"
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Caller's gate
+        run: ${{ inputs.gate }}
+
+  automerge:
+    name: Dependabot auto-merge
+    needs: gate
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      PR_URL: ${{ github.event.pull_request.html_url }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v3
+
+      # One run per PR, in parallel — a concurrency group shared across PRs keeps
+      # a single pending run and cancels the rest, which silently drops the middle
+      # PRs of a batch. Parallel merges race instead ("base branch was modified"),
+      # hence the retry. Two outcomes are not failures: the head moved (a newer
+      # run owns it) and a conflict (Dependabot rebases, which re-triggers this).
+      # --match-head-commit keeps the merge to the commit the gate ran on.
+      - name: Merge (patch/minor)
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: |
+          for attempt in 1 2 3 4; do
+            gh pr merge --squash --delete-branch --match-head-commit "$HEAD_SHA" "$PR_URL" && exit 0
+            read -r state mergeable head < <(gh pr view "$PR_URL" --json state,mergeable,headRefOid \
+              --jq '[.state, .mergeable, .headRefOid] | @tsv') || true
+            [ "$state" = MERGED ] && exit 0
+            if [ -n "$head" ] && [ "$head" != "$HEAD_SHA" ]; then
+              echo "::notice::Head moved to ${head:0:7} — the run for that commit owns the merge."; exit 0
+            fi
+            if [ "$mergeable" = CONFLICTING ]; then
+              echo "::notice::Conflicts with the base branch — Dependabot rebases, which re-runs this."; exit 0
+            fi
+            echo "merge attempt $attempt failed (state=$state mergeable=$mergeable); retrying"
+            sleep $((attempt * 20))
+          done
+          echo "::error::Could not merge after 4 attempts"; exit 1
+
+      # Once per PR: every rebase re-runs this job, and a comment per run buries
+      # the PR.
+      - name: Flag major for manual review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        env:
+          NOTE: Major version bump — the gate passed, but it is not auto-merged. Review and merge manually.
+        run: |
+          if gh pr view "$PR_URL" --json comments --jq '.comments[].body' | grep -qF "$NOTE"; then
+            echo "Already flagged."
+          else
+            gh pr comment "$PR_URL" --body "$NOTE"
+          fi

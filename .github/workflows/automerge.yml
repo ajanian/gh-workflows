@@ -1,0 +1,66 @@
+# LEGACY — superseded by pr.yml, which gates every PR and merges Dependabot's
+# behind the same gate. Kept only until every caller has moved; do not adopt.
+#
+# Reusable: self-gated auto-merge for Dependabot patch/minor bumps. Called from
+# each repo's dependabot-automerge.yml stub, which owns the `pull_request`
+# trigger, the concurrency group (parallel merges race: "base branch was
+# modified") and the permissions; this file owns the behaviour, and the caller
+# passes its build/test gate as a shell input.
+#
+# Why self-gated: branch-protection-based auto-merge needs GitHub Pro on private
+# repos, so the gate runs right here and the merge happens only if it passes.
+# Majors are never merged — they get a comment and stay open for a human.
+#
+# Deploy implication: merges made with GITHUB_TOKEN do NOT trigger the Deploy
+# push workflow (GitHub's anti-recursion rule). Deploy's 6-hourly drift check
+# picks them up, so a gated bump reaches production within ~6 hours.
+name: Dependabot auto-merge (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      gate:
+        description: Shell run on the PR's head after checkout + setup-node (npm ci, build, tests…). Non-zero = no merge.
+        required: true
+        type: string
+      node_version:
+        type: string
+        default: "20"
+
+jobs:
+  automerge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v3
+
+      - uses: actions/checkout@v7
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/setup-node@v7
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: npm
+
+      - name: Caller's gate
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: ${{ inputs.gate }}
+
+      - name: Merge (patch/minor, gate passed)
+        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        run: gh pr merge --squash --delete-branch "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Flag major for manual review
+        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        run: gh pr comment "$PR_URL" --body "Major version bump — not auto-merged, review manually."
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

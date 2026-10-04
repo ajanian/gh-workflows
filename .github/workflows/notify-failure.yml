@@ -1,0 +1,94 @@
+# Reusable: failure-only notifications. Called from each repo's notify-failure.yml
+# stub, which owns the `workflow_run` trigger (a trigger cannot live here) and
+# passes its secrets with `secrets: inherit`.
+#
+# Why a separate workflow and not a last step: `workflow_run` delivers the watched
+# run's *final* conclusion, so this sees `cancelled` and `timed_out` — neither of
+# which an in-workflow `if: failure()` step runs on (a job timeout is a cancel).
+# It also runs on main with secrets when the watched run was a Dependabot PR,
+# which gets none.
+#
+# Two outputs for two failure classes:
+#   Slack webhook  — a run failed. Rich, immediate, links the run.
+#   healthchecks   — the Deploy schedule stopped running. GitHub disables
+#                    `schedule` after 60 days without repo activity, and a
+#                    workflow that never runs cannot report anything. Every
+#                    Deploy completion pings `<repo>-deploy` (`/fail` on
+#                    non-success); healthchecks pages when the pings stop.
+#                    Period 6h, grace 1h, matching the drift cron.
+#
+# What it cannot see: itself. A missing secret or revoked webhook fails THIS run
+# (red in the Actions tab) but sends nothing — healthchecks is the backstop.
+# Named distinctly from the caller stub ("Notify on failure") so `gh workflow run`
+# resolves unambiguously in repos that carry a local copy of this file.
+name: Notify on failure (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      test_conclusion:
+        description: "Set by the stub's workflow_dispatch to simulate a run (failure|success). Empty for real events."
+        type: string
+        default: ""
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: true
+      HC_PING_KEY:
+        required: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Every Deploy completion (the heartbeat needs the successes too), any other
+    # workflow only when it did not succeed, and every manual wiring test.
+    if: >-
+      inputs.test_conclusion != ''
+      || github.event.workflow_run.name == 'Deploy'
+      || github.event.workflow_run.conclusion != 'success'
+    env:
+      # Real values from the completed run; fallbacks make the manual test honest.
+      REPO: ${{ github.repository }}
+      WORKFLOW: ${{ github.event.workflow_run.name || 'Notify on failure (manual test)' }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion || inputs.test_conclusion }}
+      EVENT: ${{ github.event.workflow_run.event || github.event_name }}
+      BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+      MESSAGE: ${{ github.event.workflow_run.head_commit.message || 'manual wiring test' }}
+      ACTOR: ${{ github.event.workflow_run.actor.login || github.actor }}
+      RUN_URL: ${{ github.event.workflow_run.html_url || format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+    steps:
+      - name: Slack (non-success only)
+        if: env.CONCLUSION != 'success'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -n "$SLACK_WEBHOOK_URL" ] || { echo "::error::SLACK_WEBHOOK_URL secret is not set"; exit 1; }
+          # Values go through --arg, never interpolated into the JSON: commit
+          # messages contain quotes.
+          PAYLOAD=$(jq -cn --arg r "$REPO" --arg w "$WORKFLOW" --arg c "$CONCLUSION" --arg b "$BRANCH" \
+                           --arg e "$EVENT" --arg u "$RUN_URL" --arg s "${SHA:0:7}" --arg m "$MESSAGE" --arg a "$ACTOR" \
+            '{text: ":rotating_light: *\($r)* — `\($w)` *\($c)* on `\($b)` (\($e))\n<\($u)|Open the run> · `\($s)` \($m | split("\n")[0]) · \($a)"}')
+          CODE=$(curl -sS --max-time 10 --retry 3 --retry-delay 3 -o /dev/null -w '%{http_code}' \
+                   -H 'content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL")
+          [ "$CODE" = 200 ] || { echo "::error::Slack webhook returned HTTP $CODE"; exit 1; }
+          echo "slack: posted $WORKFLOW/$CONCLUSION"
+
+      - name: healthchecks ping (Deploy heartbeat)
+        if: env.WORKFLOW == 'Deploy' || inputs.test_conclusion != ''
+        env:
+          HC_PING_KEY: ${{ secrets.HC_PING_KEY }}
+        run: |
+          [ -n "$HC_PING_KEY" ] || { echo "::error::HC_PING_KEY secret is not set"; exit 1; }
+          SLUG="${REPO#*/}-deploy"
+          URL="https://hc-ping.com/$HC_PING_KEY/$SLUG"
+          [ "$CONCLUSION" = success ] || URL="$URL/fail"
+          # No ?create=1: a typo'd slug must 404 here, not silently mint a check
+          # with default timings nobody configured.
+          CODE=$(curl -sS --max-time 10 --retry 3 --retry-delay 3 -o /dev/null -w '%{http_code}' \
+                   --data-raw "$CONCLUSION $RUN_URL" "$URL")
+          case "$CODE" in
+            200) echo "healthchecks: $SLUG ← $CONCLUSION" ;;
+            404) echo "::error::healthchecks slug '$SLUG' does not exist — create it (period 6h, grace 1h)"; exit 1 ;;
+            *)   echo "::error::healthchecks returned HTTP $CODE for '$SLUG'"; exit 1 ;;
+          esac

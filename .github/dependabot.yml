@@ -1,0 +1,12 @@
+# The third-party actions every caller depends on are pinned here and nowhere
+# else. Action bumps are majors by nature (v7 → v8), so they are reviewed by hand:
+# merging one changes every caller's next run.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

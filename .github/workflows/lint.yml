@@ -1,0 +1,21 @@
+# This repo's own check: every caller runs these files from `main` on its next
+# run, so a syntax error here is an outage everywhere. actionlint also runs
+# shellcheck over the `run:` blocks.
+name: Lint
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:latest -color
