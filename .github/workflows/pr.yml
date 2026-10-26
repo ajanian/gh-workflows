@@ -29,6 +29,15 @@ on:
       node_version:
         type: string
         default: "26"
+      # npm or pnpm — picks setup-node's cache and, for pnpm, installs it first
+      # (setup-node's pnpm cache needs the binary present). pnpm 12 writes the
+      # lockfileVersion 9.0 the repos carry; the Macs run 12 too.
+      package_manager:
+        type: string
+        default: npm
+      pnpm_version:
+        type: string
+        default: "12"
 
 jobs:
   gate:
@@ -40,10 +49,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - if: inputs.package_manager == 'pnpm'
+        uses: pnpm/action-setup@v6
+        with:
+          version: ${{ inputs.pnpm_version }}
+
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ inputs.node_version }}
-          cache: npm
+          cache: ${{ inputs.package_manager }}
 
       - name: Caller's gate
         run: ${{ inputs.gate }}
