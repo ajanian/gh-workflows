@@ -8,8 +8,15 @@
 #   gate       — checkout the PR merged into its base (the default pull_request
 #                ref), setup-node, run the caller's commands. Read-only token.
 #   automerge  — Dependabot PRs only, and only after `gate` passed: squash-merge
-#                bumps that are positively patch or minor; anything else gets one
+#                it, majors included. With `merge_majors: false` only bumps that
+#                are positively patch or minor merge; anything else gets one
 #                comment and stays open for a human.
+#
+# Why majors merge by default (2026-10-26): held majors were where the security
+# backlog sat — 166 open alerts across 17 packages waited on a human merge that
+# never came. A major that builds and passes the gate is merged; one that breaks
+# fails the gate and shows up red (and in githubmonitor), and a Cloud Run deploy
+# still has its smoke check and rollback behind it.
 #
 # Why self-gated: branch-protection auto-merge needs a paid plan on private
 # repos, so the merge happens here, behind `needs: gate`.
@@ -38,6 +45,10 @@ on:
       pnpm_version:
         type: string
         default: "12"
+      # false = the old rule: hold majors (and bumps of unknown size) for a human.
+      merge_majors:
+        type: boolean
+        default: true
 
 jobs:
   gate:
@@ -79,17 +90,22 @@ jobs:
       - id: meta
         uses: dependabot/fetch-metadata@v3
 
-      # Merge only what is positively patch or minor. Version updates state their
-      # update-type; security updates do not, and fetch-metadata derives it from
-      # the versions when it can and leaves it empty when it cannot (typically a
-      # multi-package PR). An unknown is treated like a major, not waved through.
+      # With merge_majors (the default) everything that passed the gate merges.
+      # Otherwise only what is positively patch or minor: version updates state
+      # their update-type; security updates do not, and fetch-metadata derives it
+      # from the versions when it can and leaves it empty when it cannot
+      # (typically a multi-package PR). Then an unknown is treated like a major.
       - id: kind
         env:
           DEPS: ${{ steps.meta.outputs.updated-dependencies-json }}
+          MERGE_MAJORS: ${{ inputs.merge_majors }}
         run: |
           held=$(jq -r '[.[] | select(.updateType != "version-update:semver-patch" and .updateType != "version-update:semver-minor") | .dependencyName] | join(", ")' <<<"$DEPS")
           count=$(jq -r 'length' <<<"$DEPS")
-          if [ "$count" -gt 0 ] && [ -z "$held" ]; then
+          if [ "$MERGE_MAJORS" = true ]; then
+            echo "safe=true" >> "$GITHUB_OUTPUT"
+            if [ -n "$held" ]; then echo "Merging a major (merge_majors): $held"; fi
+          elif [ "$count" -gt 0 ] && [ -z "$held" ]; then
             echo "safe=true" >> "$GITHUB_OUTPUT"
           else
             echo "safe=false" >> "$GITHUB_OUTPUT"
