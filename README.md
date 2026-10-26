@@ -37,6 +37,11 @@ jobs:
         npm test
 ```
 
+A pnpm repo adds `package_manager: pnpm` (and `pnpm_version` if not 12) and runs
+`pnpm install --frozen-lockfile` in its gate. A repo with nothing to deploy — a CLI, a
+launchd job, a Pi script — takes `ci.yml` and `dependabot.yml` alone; `pr.yml` does not
+assume Cloud Run.
+
 ```yaml
 # .github/workflows/deploy.yml
 name: Deploy
